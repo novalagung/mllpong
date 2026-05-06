@@ -1,7 +1,7 @@
 # MLLPong - HL7 MLLP Mock Server
 
 <p align="center">
-  <img src="https://d2laqhth0lv2w7.cloudfront.net/mllpong.png" alt="MLLPong" width="180">
+  <img src="https://cdn.novalagung.com/mllpong/images/mllpong.png" alt="MLLPong" width="180">
 </p>
 
 <p align="center">
