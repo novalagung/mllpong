@@ -8,10 +8,12 @@ services:
       CHAOS_PORT: 2576
       SMART_PORT: 2577
       RULES_FILE: /etc/hl7/rules.json
+      # SAVE_PATH: /var/hl7/files
     ports:
       - "2575:2575"
       - "2576:2576"
       - "2577:2577"
     volumes:
       - ./rules.json:/etc/hl7/rules.json:ro
+      # - ./files:/var/hl7/files
     restart: unless-stopped

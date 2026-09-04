@@ -182,6 +182,38 @@ All options can be set via CLI flag or environment variable. CLI flags take prec
 | `--chaos-port` | `CHAOS_PORT` | `2576` | Port for the always-NACK chaos handler |
 | `--smart-port` | `SMART_PORT` | `2577` | Port for the rule-based smart handler |
 | `--rules-file` | `RULES_FILE` | `rules.json` | Path to the smart handler rules JSON file |
+| `--save-path` | `SAVE_PATH` | _(empty)_ | Directory to save every inbound message to. Saving is off when empty |
+
+## Saving Inbound Messages
+
+Point `--save-path` at a directory and MLLPong writes every message it receives — on all three ports — to its own file. The directory is created at startup if it does not exist.
+
+```bash
+mllpong --save-path ./files
+```
+
+Each file is the raw HL7 payload with the MLLP framing bytes stripped, named so that the files sort chronologically and stay identifiable:
+
+```
+files/
+├── 20240101-120000.512-000001-ADT-A01-MSG001.hl7
+├── 20240101-120001.037-000002-ORU-R01-MSG002.hl7
+└── 20240101-120002.884-000003-unknown-unknown.hl7
+```
+
+The name is `<timestamp>-<sequence>-<message type>-<control ID>.hl7`. Nothing is ever overwritten: the sequence number keeps concurrent connections apart even when a sender replays the same control ID. Messages with no parsable `MSH` segment are still saved, under `unknown-unknown`.
+
+With Docker, mount a volume for the files to land in:
+
+```bash
+docker run -d \
+  -e SAVE_PATH=/var/hl7/files \
+  -p 2575:2575 \
+  -p 2576:2576 \
+  -p 2577:2577 \
+  -v ./files:/var/hl7/files \
+  novalagung/mllpong:latest
+```
 
 ## Smart Handler
 

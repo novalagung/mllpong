@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,7 +28,7 @@ const (
 	mllpEnd2  = byte(0x0D)
 )
 
-// hl7Fields splits an HL7 segment string by "|" and returns 0-indexed slice.
+// hl7Fields splits an HL7 segment string by "|" into a 0-indexed slice.
 // Index 0 is the segment name, index 1 is MSH.2, index N is MSH.(N+1).
 func hl7Fields(segment string) []string {
 	return strings.Split(segment, "|")
@@ -299,6 +300,72 @@ func chaosHandler(raw string) []byte {
 	return buildNACK(msh, 207, "E", "Unknown error occurred: Eeeevil!")
 }
 
+var saveSeq atomic.Uint64
+
+// safeFilePart sanitizes a network-supplied value for use in a file name.
+// Anything outside [A-Za-z0-9-] becomes "_", capped at 64 characters.
+func safeFilePart(s string) string {
+	var sb strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
+			sb.WriteRune(r)
+		default:
+			sb.WriteRune('_')
+		}
+		if sb.Len() >= 64 {
+			break
+		}
+	}
+	if sb.Len() == 0 {
+		return "unknown"
+	}
+	return sb.String()
+}
+
+// saveFileName builds the file name for an inbound message.
+// Format: "<timestamp>-<sequence>-<message type>-<control ID>.hl7".
+func saveFileName(msh []string) string {
+	msh9 := field(msh, 8)
+	label := messageType(msh9)
+	if trigEvt := triggerEvent(msh9); trigEvt != "" {
+		label += "-" + trigEvt
+	}
+	return fmt.Sprintf("%s-%06d-%s-%s.hl7",
+		time.Now().Format("20060102-150405.000"),
+		saveSeq.Add(1),
+		safeFilePart(label),
+		safeFilePart(field(msh, 9)))
+}
+
+// saveMessage writes an inbound message to dir and returns its path.
+// Messages without a parsable MSH segment are saved as "unknown".
+func saveMessage(dir, raw string) (string, error) {
+	msh, _ := parseMSH(raw)
+	path := filepath.Join(dir, saveFileName(msh))
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		return "", fmt.Errorf("write %q: %w", path, err)
+	}
+	return path, nil
+}
+
+// withSaver wraps handler to persist every inbound message to dir.
+// An empty dir disables saving.
+func withSaver(dir string, handler handlerFunc) handlerFunc {
+	if dir == "" {
+		return handler
+	}
+	return func(raw string) []byte {
+		path, err := saveMessage(dir, raw)
+		if err != nil {
+			log.Printf("Save error: %v", err)
+		} else {
+			log.Printf("Saved inbound message to %s", path)
+		}
+		return handler(raw)
+	}
+}
+
 func handleConn(conn net.Conn, handler handlerFunc) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
@@ -340,16 +407,23 @@ func mustListen(addr string) net.Listener {
 	return ln
 }
 
-func run(host, ackPort, chaosPort, smartPort, rulesFile string) {
+func run(host, ackPort, chaosPort, smartPort, rulesFile, savePath string) {
 	var wg sync.WaitGroup
+
+	if savePath != "" {
+		if err := os.MkdirAll(savePath, 0o755); err != nil {
+			log.Fatalf("Failed to create save path %s: %v", savePath, err)
+		}
+		log.Printf("💾 SAVING INBOUND MESSAGES TO %s", savePath)
+	}
 
 	log.Printf("👹 STARTING CHAOS HANDLER ON PORT %s", chaosPort)
 	wg.Add(1)
-	go serve(mustListen(host+":"+chaosPort), chaosHandler, &wg)
+	go serve(mustListen(host+":"+chaosPort), withSaver(savePath, chaosHandler), &wg)
 
 	log.Printf("👍 STARTING ALWAYS ACK SERVER ON PORT %s", ackPort)
 	wg.Add(1)
-	go serve(mustListen(host+":"+ackPort), ackAllHandler, &wg)
+	go serve(mustListen(host+":"+ackPort), withSaver(savePath, ackAllHandler), &wg)
 
 	rules, rulesSource, err := loadRules(rulesFile)
 	if err != nil {
@@ -357,7 +431,7 @@ func run(host, ackPort, chaosPort, smartPort, rulesFile string) {
 	}
 	log.Printf("🧠 STARTING SMART HANDLER ON PORT %s (rules: %s, %d rules loaded)", smartPort, rulesSource, len(rules.Rules))
 	wg.Add(1)
-	go serve(mustListen(host+":"+smartPort), smartHandler(rules), &wg)
+	go serve(mustListen(host+":"+smartPort), withSaver(savePath, smartHandler(rules)), &wg)
 
 	wg.Wait()
 }
@@ -375,11 +449,12 @@ func main() {
 	chaosPort := flag.String("chaos-port", envOr("CHAOS_PORT", "2576"), "port for the always-NACK chaos handler")
 	smartPort := flag.String("smart-port", envOr("SMART_PORT", "2577"), "port for the rule-based smart handler")
 	rulesFile := flag.String("rules-file", envOr("RULES_FILE", "rules.json"), "path to the smart handler rules JSON file")
+	savePath := flag.String("save-path", envOr("SAVE_PATH", ""), "directory to save every inbound message to (saving is off when empty)")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Println("STARTING MLLPONG 🏓")
 	log.Println("---")
 
-	run(*host, *ackPort, *chaosPort, *smartPort, *rulesFile)
+	run(*host, *ackPort, *chaosPort, *smartPort, *rulesFile, *savePath)
 }

@@ -696,7 +696,7 @@ func TestServe_StopsOnListenerClose(t *testing.T) {
 
 // --- In-process tests: run ---
 
-func TestRun_StartsAllThreeHandlers(t *testing.T) {
+func TestRun_StartsAllThreeHandlersAndSaves(t *testing.T) {
 	ackLn, _ := net.Listen("tcp", "127.0.0.1:0")
 	chaosLn, _ := net.Listen("tcp", "127.0.0.1:0")
 	smartLn, _ := net.Listen("tcp", "127.0.0.1:0")
@@ -711,11 +711,14 @@ func TestRun_StartsAllThreeHandlers(t *testing.T) {
 	chaosLn.Close()
 	smartLn.Close()
 
+	saveDir := filepath.Join(t.TempDir(), "files")
+
 	go run("127.0.0.1",
 		fmt.Sprintf("%d", ackPort),
 		fmt.Sprintf("%d", chaosPort),
 		fmt.Sprintf("%d", smartPort),
 		"/nonexistent/rules.json",
+		saveDir,
 	)
 
 	waitReady := func(addr string) {
@@ -742,6 +745,14 @@ func TestRun_StartsAllThreeHandlers(t *testing.T) {
 	if ack, _, _ := getMSA(sendAndReceive(t, smartAddr, buildHL7("ADT", "A01"))); ack != "AA" {
 		t.Errorf("smart handler: expected AA, got %q", ack)
 	}
+
+	entries, err := os.ReadDir(saveDir)
+	if err != nil {
+		t.Fatalf("read save dir: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Errorf("expected all 3 handlers to save their message, got %d files", len(entries))
+	}
 }
 
 // --- Unit tests: readMLLP EOF paths ---
@@ -766,5 +777,252 @@ func TestReadMLLP_EOFAfterFalseEnd(t *testing.T) {
 	_, err := readMLLP(bufio.NewReader(bytes.NewReader(raw)))
 	if err != io.EOF {
 		t.Errorf("expected io.EOF, got %v", err)
+	}
+}
+
+// --- Unit tests: safeFilePart ---
+
+func TestSafeFilePart(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"ADT-A01", "ADT-A01"},
+		{"MSG001", "MSG001"},
+		{"", "unknown"},
+		{"../../etc/passwd", "______etc_passwd"},
+		{"..", "__"},
+		{"a/b\\c:d*e?f", "a_b_c_d_e_f"},
+		{"ctrl id", "ctrl_id"},
+		{"2.5", "2_5"},
+	}
+	for _, c := range cases {
+		if got := safeFilePart(c.input); got != c.want {
+			t.Errorf("safeFilePart(%q) = %q, want %q", c.input, got, c.want)
+		}
+	}
+}
+
+func TestSafeFilePart_Truncates(t *testing.T) {
+	got := safeFilePart(strings.Repeat("A", 200))
+	if len(got) != 64 {
+		t.Errorf("expected 64 chars, got %d", len(got))
+	}
+}
+
+// --- Unit tests: saveMessage ---
+
+func TestSaveMessage_WritesRawMessage(t *testing.T) {
+	dir := t.TempDir()
+	msg := buildHL7("ADT", "A01")
+
+	path, err := saveMessage(dir, msg)
+	if err != nil {
+		t.Fatalf("saveMessage: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != msg {
+		t.Errorf("saved content = %q, want %q", got, msg)
+	}
+}
+
+func TestSaveMessage_FileNameCarriesTypeAndControlID(t *testing.T) {
+	dir := t.TempDir()
+
+	path, err := saveMessage(dir, buildHL7("ORU", "R01"))
+	if err != nil {
+		t.Fatalf("saveMessage: %v", err)
+	}
+
+	name := filepath.Base(path)
+	if !strings.Contains(name, "ORU-R01") {
+		t.Errorf("file name %q missing message type", name)
+	}
+	if !strings.Contains(name, "CTRL001") {
+		t.Errorf("file name %q missing control ID", name)
+	}
+	if !strings.HasSuffix(name, ".hl7") {
+		t.Errorf("file name %q missing .hl7 extension", name)
+	}
+}
+
+func TestSaveMessage_UnparsableMessage(t *testing.T) {
+	dir := t.TempDir()
+
+	path, err := saveMessage(dir, "not an hl7 message")
+	if err != nil {
+		t.Fatalf("saveMessage: %v", err)
+	}
+
+	if name := filepath.Base(path); !strings.Contains(name, "unknown") {
+		t.Errorf("file name %q should mark the message as unknown", name)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != "not an hl7 message" {
+		t.Errorf("saved content = %q, want the raw message", got)
+	}
+}
+
+func TestSaveMessage_IdenticalMessagesDoNotOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	msg := buildHL7("ADT", "A01")
+
+	first, err := saveMessage(dir, msg)
+	if err != nil {
+		t.Fatalf("saveMessage: %v", err)
+	}
+	second, err := saveMessage(dir, msg)
+	if err != nil {
+		t.Fatalf("saveMessage: %v", err)
+	}
+
+	if first == second {
+		t.Fatalf("both messages landed in %q", first)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("expected 2 files, got %d", len(entries))
+	}
+}
+
+func TestSaveMessage_ConcurrentSavesAreUnique(t *testing.T) {
+	dir := t.TempDir()
+	msg := buildHL7("ADT", "A01")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := saveMessage(dir, msg); err != nil {
+				t.Errorf("saveMessage: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 50 {
+		t.Errorf("expected 50 files, got %d", len(entries))
+	}
+}
+
+func TestSaveMessage_ControlIDCannotEscapeDir(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "files")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	msg := "MSH|^~\\&|S|SF|R|RF|20240101120000||ADT^A01^ADT_A01|../../escaped|P|2.5\r"
+
+	path, err := saveMessage(dir, msg)
+	if err != nil {
+		t.Fatalf("saveMessage: %v", err)
+	}
+
+	if filepath.Dir(path) != dir {
+		t.Errorf("message escaped to %q, want it inside %q", path, dir)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read root: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("expected only the files dir in root, got %d entries", len(entries))
+	}
+}
+
+func TestSaveMessage_MissingDirReturnsError(t *testing.T) {
+	_, err := saveMessage(filepath.Join(t.TempDir(), "nope"), buildHL7("ADT", "A01"))
+	if err == nil {
+		t.Error("expected an error when the save dir does not exist")
+	}
+}
+
+// --- Unit tests: withSaver ---
+
+func TestWithSaver_EmptyPathDisablesSaving(t *testing.T) {
+	dir := t.TempDir()
+
+	handler := withSaver("", ackAllHandler)
+	if ack, _, _ := getMSA(string(handler(buildHL7("ADT", "A01")))); ack != "AA" {
+		t.Errorf("expected AA, got %q", ack)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected no files, got %d", len(entries))
+	}
+}
+
+func TestWithSaver_SavesForEveryHandler(t *testing.T) {
+	handlers := map[string]handlerFunc{
+		"ack":   ackAllHandler,
+		"chaos": chaosHandler,
+		"smart": makeSmartHandler([]Rule{{Match: "*", Response: "AA"}}),
+	}
+	for name, h := range handlers {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			msg := buildHL7("ADT", "A01")
+
+			resp := withSaver(dir, h)(msg)
+			if _, ctrlID, _ := getMSA(string(resp)); ctrlID != "CTRL001" {
+				t.Errorf("handler did not answer the message, got ctrl-id %q", ctrlID)
+			}
+
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatalf("read dir: %v", err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("expected 1 saved file, got %d", len(entries))
+			}
+			got, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
+			if err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			if string(got) != msg {
+				t.Errorf("saved content = %q, want %q", got, msg)
+			}
+		})
+	}
+}
+
+func TestWithSaver_StillAnswersWhenSaveFails(t *testing.T) {
+	handler := withSaver(filepath.Join(t.TempDir(), "nope"), ackAllHandler)
+	if ack, _, _ := getMSA(string(handler(buildHL7("ADT", "A01")))); ack != "AA" {
+		t.Errorf("expected AA despite the save failure, got %q", ack)
+	}
+}
+
+// --- In-process tests: withSaver ---
+
+func TestWithSaver_SavesOverTheWire(t *testing.T) {
+	dir := t.TempDir()
+	addr := startTestServer(t, withSaver(dir, ackAllHandler))
+
+	sendAndReceive(t, addr, buildHL7("ADT", "A01"))
+	sendAndReceive(t, addr, buildHL7("ORU", "R01"))
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("expected 2 saved files, got %d", len(entries))
 	}
 }
