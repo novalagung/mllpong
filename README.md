@@ -22,6 +22,8 @@ It exposes three TCP endpoints with different behaviors:
 | Chaos handler | `2576` | Always replies with `AR` (application reject) |
 | Smart handler | `2577` | Responds based on message type rules from a JSON config file |
 
+Every message received on any of the three ports can optionally be written to disk for later inspection. See [Saving Inbound Messages](#saving-inbound-messages).
+
 ## Installation
 
 #### ◉ Homebrew (macOS / Linux)
@@ -76,7 +78,7 @@ mllpong
 With CLI flags:
 
 ```bash
-mllpong --ack-port 2575 --chaos-port 2576 --smart-port 2577 --rules-file /etc/hl7/rules.json
+mllpong --ack-port 2575 --chaos-port 2576 --smart-port 2577 --rules-file /etc/hl7/rules.json --save-path ./files
 ```
 
 To see all available options:
@@ -110,6 +112,23 @@ docker run -d \
   -p 2576:2576 \
   -p 2577:2577 \
   -v ./rules.json:/etc/hl7/rules.json:ro \
+  novalagung/mllpong:latest
+```
+
+Or with inbound messages saved to `./files`:
+
+```bash
+docker run -d \
+  -e ACK_PORT=2575 \
+  -e CHAOS_PORT=2576 \
+  -e SMART_PORT=2577 \
+  -e RULES_FILE=/etc/hl7/rules.json \
+  -e SAVE_PATH=/var/hl7/files \
+  -p 2575:2575 \
+  -p 2576:2576 \
+  -p 2577:2577 \
+  -v ./rules.json:/etc/hl7/rules.json:ro \
+  -v ./files:/var/hl7/files \
   novalagung/mllpong:latest
 ```
 
@@ -151,6 +170,30 @@ services:
       - "2577:2577"
     volumes:
       - ./rules.json:/etc/hl7/rules.json:ro
+    restart: unless-stopped
+```
+
+Or with inbound messages saved to `./files`:
+
+```bash
+services:
+  mllpong:
+    image: novalagung/mllpong:latest
+    # build: .
+    environment:
+      HOST: "0.0.0.0"
+      ACK_PORT: 2575
+      CHAOS_PORT: 2576
+      SMART_PORT: 2577
+      RULES_FILE: /etc/hl7/rules.json
+      SAVE_PATH: /var/hl7/files
+    ports:
+      - "2575:2575"
+      - "2576:2576"
+      - "2577:2577"
+    volumes:
+      - ./rules.json:/etc/hl7/rules.json:ro
+      - ./files:/var/hl7/files
     restart: unless-stopped
 ```
 
@@ -203,17 +246,7 @@ files/
 
 The name is `<timestamp>-<sequence>-<message type>-<control ID>.hl7`. Nothing is ever overwritten: the sequence number keeps concurrent connections apart even when a sender replays the same control ID. Messages with no parsable `MSH` segment are still saved, under `unknown-unknown`.
 
-With Docker, mount a volume for the files to land in:
-
-```bash
-docker run -d \
-  -e SAVE_PATH=/var/hl7/files \
-  -p 2575:2575 \
-  -p 2576:2576 \
-  -p 2577:2577 \
-  -v ./files:/var/hl7/files \
-  novalagung/mllpong:latest
-```
+Under Docker, set `SAVE_PATH` to a path inside the container and mount a volume there so the files land on the host — see the Docker and Docker Compose examples under [Running MLLPong](#running-mllpong).
 
 ## Smart Handler
 
